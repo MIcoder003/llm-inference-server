@@ -24,33 +24,39 @@ std::string detokenize(const llama_vocab * vocab, llama_token id) {
 }
 
 struct Sequence {
-    int                      seq_id        = -1;
+    int                      seq_id         = -1;
     std::string              prompt;
     std::vector<llama_token> tokens;
-    int                      n_past        = 0;
-    int                      batch_idx     = -1;
-    int                      n_decode      = 0;
-    bool                     done          = false;
-    bool                     needs_prefill = false;
+    int                      n_prompt       = 0;   // fixed at tokenize time
+    int                      prefill_offset = 0;   // prompt tokens already in KV cache
+    int                      n_past         = 0;
+    int                      batch_idx      = -1;
+    int                      n_decode       = 0;
+    bool                     done           = false;
+    bool                     needs_prefill  = false;
     std::string              output;
 };
 
 int main(int argc, char* argv[]) {
     std::string model_path = "models/gemma-3-1b-it-Q4_K_M.gguf";
 
-    // 6 requests, 3 slots -> three of these must queue
     std::vector<std::string> prompts{
-        "The capital of France is",
         "The capital of India is",
+        "In an era where aliens have invaded and taken over feudal Tokyo, an unemployed samurai finds work however he can.",
         "The capital of Spain is",
         "The capital of Japan is",
         "The capital of Brazil is",
         "The capital of Kenya is"
     };
 
-    int ngl        = 99;
-    int n_predict  = 5;
-    int n_seq_max  = 3;      // slot count — now a policy choice, not prompts.size()
+    int ngl          = 99;
+    int n_predict    = 5;
+    int n_seq_max    = 3;
+    int n_batch_size = 16;
+
+    if (argc > 1) n_seq_max    = std::stoi(argv[1]);
+    if (argc > 2) n_predict    = std::stoi(argv[2]);
+    if (argc > 3) n_batch_size = std::stoi(argv[3]);
 
     ggml_backend_load_all();
 
@@ -71,18 +77,18 @@ int main(int argc, char* argv[]) {
     std::vector<int>      free_slots;
 
     for (int i = 0; i < (int) prompts.size(); i++) {
+        if (prompts[i].empty()) continue;
         Sequence s;
-        s.prompt = prompts[i];
-        s.tokens = tokenize(vocab, prompts[i]);
-        waiting.push_back(s);          // no seq_id yet
+        s.prompt   = prompts[i];
+        s.tokens   = tokenize(vocab, prompts[i]);
+        s.n_prompt = (int) s.tokens.size();
+        waiting.push_back(s);
     }
 
     for (int i = n_seq_max - 1; i >= 0; i--) free_slots.push_back(i);
 
     int n_longest = 0;
-    for (auto & s : waiting) n_longest = std::max(n_longest, (int) s.tokens.size());
-
-    int n_batch_size = n_longest + n_seq_max;   // one prefill + concurrent decodes
+    for (auto & s : waiting) n_longest = std::max(n_longest, s.n_prompt);
 
     // ---- context ----
     llama_context_params ctx_params = llama_context_default_params();
@@ -113,36 +119,56 @@ int main(int argc, char* argv[]) {
         iter++;
 
         // --- ADMIT ---
-        int budget = n_batch_size;
-        budget -= (int) running.size();          // each running seq costs 1 decode token
+        int budget = n_batch_size - (int) running.size();   // reserve 1 decode token each
 
         while (!waiting.empty() && !free_slots.empty()) {
-            Sequence & next = waiting.front();
-            if ((int) next.tokens.size() > budget) break;   // all-or-nothing, no chunking
+            if (budget < 1) break;
 
-            next.seq_id = free_slots.back();
+            Sequence & next = waiting.front();
+
+            next.seq_id        = free_slots.back();
             free_slots.pop_back();
             next.needs_prefill = true;
-            budget -= (int) next.tokens.size();
+            next.n_past        = 0;
 
-            printf("[iter %d] admit slot %d <- \"%s\"\n",
-                   iter, next.seq_id, next.prompt.c_str());
+            budget -= std::min(next.n_prompt, budget);
+
+            printf("[iter %d] admit slot %d, %d prompt tokens, budget left %d <- \"%s\"\n",
+                   iter, next.seq_id, next.n_prompt, budget, next.prompt.c_str());
 
             running.push_back(next);
             waiting.erase(waiting.begin());
         }
 
+        // give the build loop the full per-iteration budget again
+        budget = n_batch_size - (int) running.size();
+
         // --- BUILD BATCH ---
         common_batch_clear(batch);
         for (auto & s : running) {
             if (s.needs_prefill) {
-                for (int i = 0; i < (int) s.tokens.size(); i++) {
-                    bool is_last = (i == (int) s.tokens.size() - 1);
-                    common_batch_add(batch, s.tokens[i], i, { s.seq_id }, is_last);
+                int remaining = s.n_prompt - s.prefill_offset;
+                int chunk     = std::max(0, std::min(remaining, budget));
+                if (chunk == 0) continue;
+
+                bool final_chunk = (chunk == remaining);
+
+                for (int i = 0; i < chunk; i++) {
+                    int  idx     = s.prefill_offset + i;
+                    bool is_last = final_chunk && (i == chunk - 1);
+                    common_batch_add(batch, s.tokens[idx], idx, { s.seq_id }, is_last);
                     if (is_last) s.batch_idx = batch.n_tokens - 1;
                 }
-                s.n_past = s.tokens.size();
-                s.needs_prefill = false;
+
+                printf("[iter %d]   prefill slot %d: %d/%d tokens%s\n",
+                       iter, s.seq_id, s.prefill_offset + chunk, s.n_prompt,
+                       final_chunk ? " (complete)" : " (partial)");
+
+                s.prefill_offset += chunk;
+                s.n_past          = s.prefill_offset;
+                budget           -= chunk;
+
+                if (final_chunk) s.needs_prefill = false;
             } else {
                 common_batch_add(batch, s.tokens.back(), s.n_past, { s.seq_id }, true);
                 s.batch_idx = batch.n_tokens - 1;
@@ -152,13 +178,20 @@ int main(int argc, char* argv[]) {
 
         if (batch.n_tokens == 0) break;
 
+        auto t0 = ggml_time_us();
         if (llama_decode(ctx, batch) != 0) {
             fprintf(stderr, "decode failed\n");
             return 1;
         }
+        auto t1 = ggml_time_us();
+
+        printf("[iter %d] batch=%d tokens, decode=%.1f ms\n",
+               iter, batch.n_tokens, (t1 - t0) / 1000.0f);
 
         // --- SAMPLE ---
         for (auto & s : running) {
+            if (s.needs_prefill) continue;   // still reading its prompt
+
             llama_token tok = llama_sampler_sample(smpl, ctx, s.batch_idx);
 
             if (llama_vocab_is_eog(vocab, tok) || s.n_decode >= n_predict) {
